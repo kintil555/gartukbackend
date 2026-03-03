@@ -1,7 +1,12 @@
 /**
  * GameRoom — Cloudflare Durable Object
- * Round 1: setiap pemain MENULIS KATA SENDIRI (bukan dari sistem)
- * Round 2+: bergantian gambar & tebak
+ *
+ * States:
+ *   lobby           → semua pemain kumpul, host bisa start
+ *   writing_phase   → semua pemain nulis kata awal
+ *   album_settings  → semua sudah nulis, HOST lihat settings, non-host loading
+ *   playing         → ronde gambar/tebak berlangsung
+ *   results         → game selesai
  */
 
 function shuffle(arr) {
@@ -51,7 +56,8 @@ export class GameRoom {
         playerOrder: [],
         chains: {},
         currentTasks: {},
-        pendingSubmissions: new Set()
+        pendingSubmissions: new Set(),
+        settings: { time: 90 }
       };
     }
 
@@ -100,12 +106,27 @@ export class GameRoom {
 
   async handleMessage(playerId, msg) {
     switch (msg.type) {
-      case 'start_game':  this.handleStartGame(playerId); break;
-      case 'submit_task': this.handleSubmit(playerId, msg.taskType, msg.content); break;
-      case 'play_again':  this.handlePlayAgain(playerId); break;
+      // Host menekan "Mulai Game" di lobby → semua masuk fase nulis kata
+      case 'start_game':
+        this.handleStartGame(playerId);
+        break;
+
+      // Host menekan "START" di album settings → mulai ronde gambar/tebak
+      case 'start_rounds':
+        this.handleStartRounds(playerId, msg.settings);
+        break;
+
+      case 'submit_task':
+        this.handleSubmit(playerId, msg.taskType, msg.content);
+        break;
+
+      case 'play_again':
+        this.handlePlayAgain(playerId);
+        break;
     }
   }
 
+  // ── 1. HOST klik "Mulai Game" → semua masuk writing phase ─────────────────
   handleStartGame(playerId) {
     if (this.room.hostId !== playerId) {
       this.sendTo(playerId, { type: 'error', message: 'Hanya host yang bisa mulai!' });
@@ -119,7 +140,6 @@ export class GameRoom {
     this.startWritingPhase();
   }
 
-  // ── Fase awal: semua pemain tulis kata/kalimat mereka sendiri ──────────────
   startWritingPhase() {
     const playerIds = [...this.sessions.keys()];
     const shuffled = shuffle(playerIds);
@@ -139,7 +159,6 @@ export class GameRoom {
 
     this.broadcastAll({ type: 'game_started', roomState: this.getPublicState() });
 
-    // Kirim tugas: tulis kata/kalimat bebas
     this.sessions.forEach((session, pid) => {
       session.status = 'writing';
       this.sendTo(pid, {
@@ -154,6 +173,48 @@ export class GameRoom {
     this.broadcastRoomUpdate();
   }
 
+  // ── 2. Semua selesai nulis → HOST masuk album_settings, non-host loading ──
+  enterAlbumSettings() {
+    this.room.gameState = 'album_settings';
+    this.sessions.forEach(s => s.status = 'waiting');
+    this.broadcastRoomUpdate();
+
+    // Kirim event khusus ke host
+    this.sendTo(this.room.hostId, {
+      type: 'show_album_settings',
+      roomState: this.getPublicState()
+    });
+
+    // Kirim event ke non-host: loading/menunggu
+    this.sessions.forEach((_, pid) => {
+      if (pid !== this.room.hostId) {
+        this.sendTo(pid, {
+          type: 'waiting_host_settings',
+          roomState: this.getPublicState()
+        });
+      }
+    });
+  }
+
+  // ── 3. HOST klik "START" di album settings → mulai ronde ──────────────────
+  handleStartRounds(playerId, settings) {
+    if (this.room.hostId !== playerId) return;
+    if (this.room.gameState !== 'album_settings') return;
+
+    if (settings) {
+      this.room.settings = { ...this.room.settings, ...settings };
+    }
+
+    this.room.gameState = 'playing';
+    this.room.round = 1;
+    this.broadcastAll({
+      type: 'rounds_starting',
+      settings: this.room.settings,
+      roomState: this.getPublicState()
+    });
+    this.distributeNextRound();
+  }
+
   // ── Submit ────────────────────────────────────────────────────────────────
   handleSubmit(playerId, taskType, content) {
     if (!this.room.pendingSubmissions.has(playerId)) return;
@@ -164,7 +225,6 @@ export class GameRoom {
     const chainOwnerId = task?.chainOwnerId;
 
     if (taskType === 'write_initial') {
-      // Kata awal = dari pemain sendiri, masuk ke chain miliknya
       this.room.chains[playerId] = [{
         type: 'word',
         content,
@@ -187,9 +247,8 @@ export class GameRoom {
 
     if (this.room.pendingSubmissions.size === 0) {
       if (this.room.gameState === 'writing_phase') {
-        this.room.gameState = 'playing';
-        this.room.round = 1;
-        this.distributeNextRound();
+        // Semua sudah nulis → host ke album settings
+        this.enterAlbumSettings();
       } else {
         this.room.round++;
         if (this.room.round > this.room.totalRounds) this.endGame();
@@ -198,7 +257,7 @@ export class GameRoom {
     }
   }
 
-  // ── Distribusi ronde: ganjil=gambar, genap=tebak ─────────────────────────
+  // ── Distribusi ronde ───────────────────────────────────────────────────────
   distributeNextRound() {
     const round = this.room.round;
     const isDrawRound = round % 2 === 1;
@@ -263,16 +322,20 @@ export class GameRoom {
     this.sessions.delete(playerId);
 
     if (this.sessions.size === 0) { this.room = null; return; }
-    if (this.room.hostId === playerId) this.room.hostId = [...this.sessions.keys()][0];
+    if (this.room.hostId === playerId) {
+      this.room.hostId = [...this.sessions.keys()][0];
+      // If disconnected during album_settings, new host gets the settings screen
+      if (this.room.gameState === 'album_settings') {
+        this.sendTo(this.room.hostId, { type: 'show_album_settings', roomState: this.getPublicState() });
+      }
+    }
 
-    const inGame = this.room.gameState === 'playing' || this.room.gameState === 'writing_phase';
+    const inGame = ['playing','writing_phase'].includes(this.room.gameState);
     if (inGame && this.room.pendingSubmissions?.has(playerId)) {
       this.room.pendingSubmissions.delete(playerId);
       if (this.room.pendingSubmissions.size === 0) {
         if (this.room.gameState === 'writing_phase') {
-          this.room.gameState = 'playing';
-          this.room.round = 1;
-          this.distributeNextRound();
+          this.enterAlbumSettings();
         } else {
           this.room.round++;
           if (this.room.round > this.room.totalRounds) this.endGame();
@@ -293,6 +356,7 @@ export class GameRoom {
       gameState: this.room.gameState,
       round: this.room.round,
       totalRounds: this.room.totalRounds,
+      settings: this.room.settings,
       players: [...this.sessions.entries()].map(([id, s]) => ({
         id, name: s.name, avatar: s.avatar || 1, status: s.status, isHost: id === this.room.hostId
       }))
