@@ -1,0 +1,12 @@
+{
+  "name": "coret-coret-backend",
+  "version": "1.0.0",
+  "description": "Coret-Coret Game Backend - Cloudflare Workers + Durable Objects",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
