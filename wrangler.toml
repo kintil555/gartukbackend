@@ -13,4 +13,4 @@ new_sqlite_classes = ["GameRoom"]
 
 [[kv_namespaces]]
 binding = "ROOMS_KV"
-id = "a4e9682f813f46e7a7bb9d328f67cd9a"
+id = "GANTI_DENGAN_KV_ID_KAMU"
